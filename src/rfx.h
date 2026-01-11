@@ -44,8 +44,9 @@ extern "C" {
 /**
  * @brief Initialize BLE radio
  * @param access_addr The 32-bit access address to use (0x8e89bed6 for BLE advertisements)
+ * @param frequency The frequency in MHz to set (note the radio is internally offset tuned)
  */
-void init_radio(uint32_t access_addr);
+void init_radio(uint32_t access_addr, int frequency);
 
 /**
  * @brief Configure bit counter event for packet reception
