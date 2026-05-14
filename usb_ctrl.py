@@ -3,6 +3,7 @@ import sys,argparse
 import usb.core
 import usb.util
 from time import sleep
+import threading, queue
 
 try:
     import tkinter as tk
@@ -14,25 +15,28 @@ try:
 except ImportError:
     GUI_AVAILABLE = False
 
-NRF_USB_EP_IN        = 0x81      # endpoint for data transfer in
+NRF_USB_EP_IN_BULK   = 0x81      # endpoint for burst data transfer in
+NRF_USB_EP_IN_ISO    = 0x88      # endpoint for stream data transfer in
 NRF_USB_EP_OUT       = 0x01      # endpoint for command transfer out
-NRF_USB_PACKET_SIZE  = 14*1024*4 # packet size
+NRF_USB_PACKET_SIZE  = 48*1024*4 # packet size
 NRF_USB_TIMEOUT_MS   = 100       # timeout for normal USB operations
 
-NRF_CMD_USBTEST     = 0xa1
-NRF_CMD_REBOOT      = 0xa2
-NRF_CMD_IQCAP_TRIG  = 0xca
-NRF_CMD_IQCAP_NOW   = 0xcb
-NRF_CMD_RADIO_STOP  = 0xcf
-NRF_CMD_PEEK32      = 0xd1
-NRF_CMD_POKE32      = 0xd2
-NRF_STR_USBTEST     = (NRF_CMD_USBTEST, 0x01, 0x00, 0x01)
-NRF_STR_REBOOT      = (NRF_CMD_REBOOT, 0x01, 0x00, 0x01)
-NRF_STR_IQCAP_TRIG  = (NRF_CMD_IQCAP_TRIG, 0x00, 0x00, 0x01)
-NRF_STR_IQCAP_NOW   = (NRF_CMD_IQCAP_NOW, 0x00, 0x00, 0x01)
-NRF_STR_RADIO_STOP  = (NRF_CMD_RADIO_STOP, 0x00, 0x00, 0x00)
-NRF_STR_PEEK32      = (NRF_CMD_PEEK32, 0x00, 0x00, 0x00, 0, 0, 0, 0)
-NRF_STR_POKE32      = (NRF_CMD_POKE32, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0)
+NRF_CMD_USBTEST      = 0xa1
+NRF_CMD_REBOOT       = 0xa2
+NRF_CMD_IQCAP_TRIG   = 0xca
+NRF_CMD_IQCAP_NOW    = 0xcb
+NRF_CMD_IQCAP_STREAM = 0xcc
+NRF_CMD_RADIO_STOP   = 0xcf
+NRF_CMD_PEEK32       = 0xd1
+NRF_CMD_POKE32       = 0xd2
+NRF_STR_USBTEST      = (NRF_CMD_USBTEST, 0x01, 0x00, 0x01)
+NRF_STR_REBOOT       = (NRF_CMD_REBOOT, 0x01, 0x00, 0x01)
+NRF_STR_IQCAP_TRIG   = (NRF_CMD_IQCAP_TRIG, 0x00, 0x00, 0x01)
+NRF_STR_IQCAP_NOW    = (NRF_CMD_IQCAP_NOW, 0x00, 0x00, 0x01)
+NRF_STR_IQCAP_STREAM = (NRF_CMD_IQCAP_STREAM, 0x00, 0x00, 0x01)
+NRF_STR_RADIO_STOP   = (NRF_CMD_RADIO_STOP, 0x00, 0x00, 0x00)
+NRF_STR_PEEK32       = (NRF_CMD_PEEK32, 0x00, 0x00, 0x00, 0, 0, 0, 0)
+NRF_STR_POKE32       = (NRF_CMD_POKE32, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0)
 
 
 BLE_FREQUENCIES = [
@@ -60,10 +64,10 @@ class USBDevice:
     def clear_pipes(self):
         try:
             self.dev.set_configuration()
-            self.dev.clear_halt(NRF_USB_EP_IN)
+            self.dev.clear_halt(NRF_USB_EP_IN_BULK)
             self.dev.clear_halt(NRF_USB_EP_OUT)
             # try a short read to flush
-            self.dev.read(NRF_USB_EP_IN, NRF_USB_PACKET_SIZE, 10)
+            self.dev.read(NRF_USB_EP_IN_BULK, NRF_USB_PACKET_SIZE, 10)
         except Exception:
             pass
 
@@ -72,21 +76,80 @@ class USBDevice:
             raise RuntimeError("USB device not found")
         return self.dev.write(NRF_USB_EP_OUT, data)
 
-    def read_packet(self, timeout=NRF_USB_TIMEOUT_MS):
+    def read_packet(self, is_streaming=False, packet_size=NRF_USB_PACKET_SIZE, timeout=NRF_USB_TIMEOUT_MS):
         if not self.found():
             raise RuntimeError("USB device not found")
-        return self.dev.read(NRF_USB_EP_IN, NRF_USB_PACKET_SIZE, timeout=timeout)
 
-    def read_stream(self, expect_trigger=False):
+        ep = NRF_USB_EP_IN_ISO if is_streaming else NRF_USB_EP_IN_BULK
+        return self.dev.read(ep, packet_size, timeout=timeout)
+
+    def read_stream(self, expect_trigger=False, is_streaming=False):
         raw_data = bytearray()
-        while True:
+
+        # ISO endpoints require multiples of the exact frame size (1000)
+        stream_packet_size = 1000 * 100 if is_streaming else NRF_USB_PACKET_SIZE
+
+        if is_streaming:
+            print("Streaming started... Press Ctrl+C to stop.")
+
+            # Use a thread to isolate libusb from Python's KeyboardInterrupt unwinding
+            q = queue.Queue()
+            stop_event = threading.Event()
+
+            def reader_thread():
+                while not stop_event.is_set():
+                    try:
+                        data = self.read_packet(is_streaming=True, packet_size=stream_packet_size, timeout=100)
+                        if data:
+                            q.put(data)
+                    except usb.core.USBError as e:
+                        # Ignore standard timeouts. Sleep briefly if it's a structural error
+                        if getattr(e, 'errno', None) not in (110, 60, 10060, None):
+                            sleep(0.01)
+                        continue
+
+            t = threading.Thread(target=reader_thread)
+            t.daemon = True
+            t.start()
+
             try:
-                data = self.read_packet(timeout=NRF_USB_TIMEOUT_MS)
-                raw_data.extend(data)
-            except usb.core.USBError:
-                if len(raw_data) == 0 and expect_trigger:
-                    continue
-                break
+                while True:
+                    try:
+                        # Wait for data with a timeout so KeyboardInterrupt can cleanly interrupt
+                        data = q.get(timeout=0.1)
+                        raw_data.extend(data)
+                        sys.stdout.write(f"\rCaptured {len(raw_data) // 1000} KB...")
+                        sys.stdout.flush()
+                    except queue.Empty:
+                        pass
+            except KeyboardInterrupt:
+                print('\nStopping stream...')
+                stop_event.set()
+                t.join(timeout=1.0)
+
+            # Now safe to issue write because the libusb read thread has cleanly exited
+            try:
+                self.write(NRF_STR_RADIO_STOP)
+                sleep(0.05)
+            except Exception:
+                pass
+
+            # Drain any remaining data in the thread queue
+            while not q.empty():
+                raw_data.extend(q.get())
+        else:
+            while True:
+                try:
+                    data = self.read_packet(is_streaming=False, packet_size=NRF_USB_PACKET_SIZE, timeout=NRF_USB_TIMEOUT_MS)
+                    if data:
+                        raw_data.extend(data)
+                except usb.core.USBError:
+                    if len(raw_data) == 0 and expect_trigger:
+                        continue
+                    break
+                except KeyboardInterrupt:
+                    break
+
         return raw_data
     
     def enter_bootloader(self):
@@ -110,9 +173,12 @@ class USBDevice:
         cmd[8:12] = value.to_bytes(4, 'big')
         self.write(cmd)
 
-    def send_iqcap(self, freq, trigger=False, delay=None):
+    def send_iqcap(self, freq, trigger=False, streaming=False, is_angles=False, delay=None):
         if trigger:
             cmd = bytearray(NRF_STR_IQCAP_TRIG)
+        elif streaming:
+            cmd = bytearray(NRF_STR_IQCAP_STREAM)
+            cmd[2] = 1 if is_angles else 0
         else:
             cmd = bytearray(NRF_STR_IQCAP_NOW)
         cmd[1] = int(freq) - 2400
@@ -124,7 +190,7 @@ class USBDevice:
             cmd[2] = 0
             cmd[3] = 1
         self.write(cmd)
-        return self.read_stream(expect_trigger=trigger)
+        return self.read_stream(expect_trigger=trigger, is_streaming=streaming)
 
 def launch_gui(device, args):
     if not GUI_AVAILABLE:
@@ -171,7 +237,7 @@ def launch_gui(device, args):
     def on_capture():
         # Get selected frequency
         idx = combo.current()
-        freq = BLE_FREQUENCIES[idx]
+        freq = BLE_FREQUENCIES[idx] +1 # radio tunes 1MHz lower than requested
 
         device.clear_pipes()
 
@@ -223,6 +289,8 @@ def main():
     parser.add_argument('-c', '--channel', help='start IQ capture on BLE channel')
     parser.add_argument('-f', '--frequency', help='start IQ capture on frequency (MHz)')
     parser.add_argument('-d', '--delay', help='delay after trigger before starting capture (us)')
+    parser.add_argument('-s', '--streaming', help='Stream 2bit IQ at 2Msps continuously', action='store_true')
+    parser.add_argument('-a', '--angles', help='For streaming, send 4bit angles instead of 2bit IQ', action='store_true')
     parser.add_argument('-t', '--trigger', help='Wait for GPIO trigger', action='store_true')
     parser.add_argument('-u', '--usbtest', help='Send test command over USB to blink the LED', action='store_true')
     parser.add_argument('--peek', help='Peek 32-bit value from address', type=lambda x: int(x, base=0))
@@ -264,16 +332,19 @@ def main():
         # device.usb_test()
     elif args.channel or args.frequency:
         if args.channel:
-            freq = BLE_FREQUENCIES[int(args.channel)]
+            freq = BLE_FREQUENCIES[int(args.channel)] +1 # radio tunes 1MHz lower than requested
             print(f'Starting capture on channel {args.channel} ({freq} MHz)')
         elif args.frequency:
             freq = int(args.frequency)
             print(f'Starting capture on {freq} MHz')
         
-        data = device.send_iqcap(freq, trigger=args.trigger, delay=args.delay)
-        with open('capture.raw', 'wb') as f:
+        data = device.send_iqcap(freq, trigger=args.trigger, streaming=args.streaming, is_angles=args.angles, delay=args.delay)
+        with open('capture_4bit.raw' if args.streaming else 'capture.raw', 'wb') as f:
             f.write(data)
-        print(f'{len(data) // 4} samples written to {f.name}')
+            if args.streaming:
+                print(f'{len(data) * 2} 4bit samples written to {f.name}')
+            else:
+                print(f'{len(data) // 4} samples written to {f.name}')
 
 if __name__ == '__main__':
     main()
